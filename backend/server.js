@@ -5,7 +5,8 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import cookieParser from "cookie-parser";
 import dotenv from "dotenv";
-
+import timetableRoutes from "./routes/timetableRoutes.js";
+import aiProxyRouter from "./routes/aiProxy.js";
 dotenv.config();
 
 const app = express();
@@ -86,5 +87,8 @@ app.post("/api/auth/logout", (req, res) => {
   res.clearCookie("token");
   res.json({ message: "Logged out" });
 });
+
+app.use("/api/ai", aiProxyRouter);
+app.use("/api/timetable", timetableRoutes);
 
 app.listen(5000, () => console.log("Server running on http://localhost:5000"));
