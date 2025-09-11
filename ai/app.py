@@ -5,8 +5,10 @@ from typing import List, Optional, Dict, Any
 from ortools.sat.python import cp_model
 import uvicorn
 from fastapi.middleware.cors import CORSMiddleware
+import random
+import time
 
-app = FastAPI(title="EduSched AI Service (Optimized)")
+app = FastAPI(title="EduSched AI Service (Hybrid Greedy + ORTools)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -52,7 +54,7 @@ class FixedSlot(BaseModel):
     batch_id: Optional[str] = None
 
 class ScheduleRequest(BaseModel):
-    days: List[str] = Field(default_factory=lambda: ["Mon","Tue","Wed","Thu","Fri"])
+    days: List[str] = Field(default_factory=lambda: ["Mon", "Tue", "Wed", "Thu", "Fri"])
     slots_per_day: int = 6
     max_classes_per_day: int = 4
     classrooms: List[Classroom] = []
@@ -69,211 +71,174 @@ def timeslot_index(day_idx: int, slot_idx: int, slots_per_day: int) -> int:
 def decode_timeslot(idx: int, slots_per_day: int):
     return idx // slots_per_day, idx % slots_per_day
 
-# ---------- Scheduler ----------
+# ---------- Greedy Pre-Fill ----------
+
+def greedy_prefill(req: ScheduleRequest, sessions: List[Dict], S: int, D: int) -> Dict[int, Dict]:
+    pre_assignments = {}
+    rng = random.Random(time.time())  # ensure randomness each call
+
+    # --- 1. Fixed Slots ---
+    for fs in req.fixed_slots:
+        t = timeslot_index(fs.day, fs.slot, S)
+        pre_assignments[t] = {
+            "session_id": f"{fs.subject_id}__fixed_{t}_{time.time_ns()}",
+            "subject_id": fs.subject_id,
+            "batch_id": fs.batch_id,
+            "faculty_id": fs.faculty_id,
+            "room_id": fs.room_id,
+            "source": "fixed"
+        }
+
+    # --- 2. Faculties with only one subject ---
+    for f in req.faculties:
+        if len(f.can_teach) == 1:
+            subj_id = f.can_teach[0]
+            subj_sessions = [s for s in sessions if s["subject_id"] == subj_id]
+            for s in subj_sessions:
+                placed = False
+                for t in range(D * S):
+                    if t not in pre_assignments:
+                        pre_assignments[t] = {
+                            "session_id": s["session_id"],
+                            "subject_id": subj_id,
+                            "batch_id": s["batch_id"],
+                            "faculty_id": f.id,
+                            "room_id": rng.choice(req.classrooms).id if req.classrooms else None,
+                            "source": "greedy"
+                        }
+                        placed = True
+                        break
+                if placed:
+                    break
+    return pre_assignments
+
+# ---------- Hybrid Scheduler ----------
 
 @app.post("/generate_timetable")
 def generate_timetable(req: ScheduleRequest) -> Dict[str, Any]:
     days = req.days
     D = len(days)
     S = req.slots_per_day
-    T = D * S  # total timeslots
+    T = D * S
 
     classrooms = req.classrooms
     batches = {b.id: b for b in req.batches}
     subjects = {s.id: s for s in req.subjects}
     faculties = {f.id: f for f in req.faculties}
-    fixed_slots = req.fixed_slots
 
-    # Build sessions
+    # Build sessions fresh every call
     sessions = []
     for subj in req.subjects:
         for i in range(subj.classes_per_week):
             sessions.append({
-                "session_id": f"{subj.id}__{i}",
+                "session_id": f"{subj.id}__{i}_{time.time_ns()}",
                 "subject_id": subj.id,
                 "batch_id": subj.batch_id,
                 "preferred_room_type": subj.preferred_room_type,
                 "size": batches.get(subj.batch_id).size if subj.batch_id in batches else 0,
             })
 
-    num_sessions = len(sessions)
-    room_ids = [r.id for r in classrooms]
-    faculty_ids = [f.id for f in req.faculties]
+    # Run greedy pre-fill
+    greedy_assignments = greedy_prefill(req, sessions, S, D)
+    used_sessions = {v["session_id"] for v in greedy_assignments.values()}
+    remaining_sessions = [s for s in sessions if s["session_id"] not in used_sessions]
 
-    # Quick maps
-    room_index = {r.id: idx for idx, r in enumerate(classrooms)}
-    faculty_index = {fid: idx for idx, fid in enumerate(faculty_ids)}
-    session_index = {s["session_id"]: idx for idx, s in enumerate(sessions)}
-
+    # --- OR-Tools for remaining sessions ---
     model = cp_model.CpModel()
-    assign = {}
+    x = {}
 
-    # Create variables
-    for si, s in enumerate(sessions):
-        possible_facs = [f for f in req.faculties if s["subject_id"] in f.can_teach]
-        if not possible_facs: continue
-        possible_rooms = [r for r in classrooms if r.capacity >= s["size"] and (not s["preferred_room_type"] or r.type == s["preferred_room_type"])]
-        if not possible_rooms: continue
+    for sess in remaining_sessions:
         for t in range(T):
-            for r in possible_rooms:
-                for f in possible_facs:
-                    if f.unavailable_slots and t in f.unavailable_slots: continue
-                    var = model.NewBoolVar(f"assign_s{si}_t{t}_r{room_index[r.id]}_f{faculty_index[f.id]}")
-                    assign[(si, t, room_index[r.id], faculty_index[f.id])] = var
+            if t in greedy_assignments:  # skip pre-filled slots
+                continue
+            for r in classrooms:
+                x[(sess["session_id"], t, r.id)] = model.NewBoolVar(
+                    f"x_{sess['session_id']}_{t}_{r.id}"
+                )
 
-    # Each session assigned at most once
-    for si in range(num_sessions):
-        vars_for_session = [v for (sidx, *_), v in assign.items() if sidx == si]
-        if vars_for_session:
-            model.Add(sum(vars_for_session) <= 1)
+    # Each session must be scheduled once
+    for sess in remaining_sessions:
+        model.Add(
+            sum(x[(sess["session_id"], t, r.id)] 
+                for t in range(T) 
+                for r in classrooms 
+                if (sess["session_id"], t, r.id) in x) == 1
+        )
 
-    # No conflicts: faculty, room, batch
-    for fid_idx, fid in enumerate(faculty_ids):
-        for t in range(T):
-            vars_fac_t = [v for (sidx, tt, rdx, fidx), v in assign.items() if tt == t and fidx == fid_idx]
-            if vars_fac_t:
-                model.Add(sum(vars_fac_t) <= 1)
-
-    for ridx, rid in enumerate(room_ids):
-        for t in range(T):
-            vars_room_t = [v for (sidx, tt, rdx, fidx), v in assign.items() if tt == t and rdx == ridx]
-            if vars_room_t:
-                model.Add(sum(vars_room_t) <= 1)
-
-    for batch_id in batches.keys():
-        for t in range(T):
-            vars_batch_t = [v for (sidx, tt, rdx, fidx), v in assign.items() if tt == t and sessions[sidx]["batch_id"] == batch_id]
-            if vars_batch_t:
-                model.Add(sum(vars_batch_t) <= 1)
-
-    # Max classes per day
-    max_per_day = req.max_classes_per_day
-    for fid_idx, fid in enumerate(faculty_ids):
-        for day in range(D):
-            slots_idx = range(day * S, (day+1)*S)
-            vars_fac_day = [v for (sidx, tt, rdx, fidx), v in assign.items() if fidx == fid_idx and tt in slots_idx]
-            if vars_fac_day:
-                model.Add(sum(vars_fac_day) <= max_per_day)
-    for batch_id in batches.keys():
-        for day in range(D):
-            slots_idx = range(day * S, (day+1)*S)
-            vars_batch_day = [v for (sidx, tt, rdx, fidx), v in assign.items() if tt in slots_idx and sessions[sidx]["batch_id"] == batch_id]
-            if vars_batch_day:
-                model.Add(sum(vars_batch_day) <= max_per_day)
-
-    # Fixed slots
-    fixed_session_assigned = set()
-    for fs in fixed_slots:
-        t = timeslot_index(fs.day, fs.slot, S)
-        candidate_sessions = [(si, s) for si, s in enumerate(sessions)
-                              if s["subject_id"].lower() == fs.subject_id.lower() and s["batch_id"] == fs.batch_id and si not in fixed_session_assigned]
-        if not candidate_sessions: continue
-        si = candidate_sessions[0][0]
-        forced_vars = []
-        for (sidx, tt, rdx, fidx), var in assign.items():
-            if sidx != si or tt != t: continue
-            if fs.room_id is not None and room_ids[rdx] != fs.room_id: continue
-            if fs.faculty_id is not None and faculty_ids[fidx] != fs.faculty_id: continue
-            forced_vars.append(var)
-        if forced_vars:
-            model.Add(sum(forced_vars) == 1)
-            fixed_session_assigned.add(si)
-
-    # Objective: maximize scheduled sessions + slot utilization - balance faculty load
-    scheduled_vars = []
-    for si in range(num_sessions):
-        vars_for_si = [v for (sidx, *_), v in assign.items() if sidx == si]
-        if vars_for_si:
-            sv = model.NewBoolVar(f"scheduled_si{si}")
-            model.Add(sum(vars_for_si) == 1).OnlyEnforceIf(sv)
-            model.Add(sum(vars_for_si) <= 0).OnlyEnforceIf(sv.Not())
-            scheduled_vars.append(sv)
-
-    fac_load = []
-    for fidx, fid in enumerate(faculty_ids):
-        vars_for_f = [v for (sidx, tt, rdx, ffidx), v in assign.items() if ffidx == fidx]
-        if vars_for_f:
-            load = model.NewIntVar(0, num_sessions, f"load_f{fidx}")
-            model.Add(load == sum(vars_for_f))
-            fac_load.append(load)
-        else:
-            fac_load.append(model.NewIntVar(0, 0, f"load_f{fidx}"))
-
-    max_load = model.NewIntVar(0, num_sessions, "max_load")
-    model.AddMaxEquality(max_load, fac_load)
-
-    # Track slot utilization
-    slot_used = {}
-    for batch_id in batches.keys():
-        for t in range(T):
-            vars_batch_t = [v for (sidx, tt, rdx, fidx), v in assign.items() if tt == t and sessions[sidx]["batch_id"] == batch_id]
-            if vars_batch_t:
-                su = model.NewBoolVar(f"slot_used_{batch_id}_t{t}")
-                model.AddMaxEquality(su, vars_batch_t)
-                slot_used[(batch_id, t)] = su
-
-    BIG, MEDIUM = 1000, 10
-    objective_terms = [sum(scheduled_vars) * BIG - max_load]
-    objective_terms += [su * MEDIUM for su in slot_used.values()]
-    model.Maximize(sum(objective_terms))
+    # Each room can only have 1 session at a time
+    for t in range(T):
+        for r in classrooms:
+            model.Add(
+                sum(x[(sess["session_id"], t, r.id)] 
+                    for sess in remaining_sessions 
+                    if (sess["session_id"], t, r.id) in x) <= 1
+            )
 
     # Solve
     solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = 60
-    solver.parameters.num_search_workers = 8
-    result = solver.Solve(model)
+    solver.parameters.max_time_in_seconds = 5
+    status = solver.Solve(model)
 
-    if result in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
-        timetable = [[] for _ in range(T)]
-        scheduled_session_ids = set()
-        unscheduled = []
+    timetable = [[] for _ in range(T)]
 
-        for (sidx, tt, rdx, fidx), var in assign.items():
-            if solver.Value(var) == 1:
-                scheduled_session_ids.add(sidx)
-                timetable[tt].append({
-                    "session_id": sessions[sidx]["session_id"],
-                    "subject_id": sessions[sidx]["subject_id"],
-                    "batch_id": sessions[sidx]["batch_id"],
-                    "room_id": room_ids[rdx],
-                    "faculty_id": faculty_ids[fidx],
-                    "day": tt // S,
-                    "slot": tt % S
-                })
+    # Fill greedy assignments
+    for t, v in greedy_assignments.items():
+        timetable[t].append({
+            "session_id": v["session_id"],
+            "subject_id": v["subject_id"],
+            "batch_id": v["batch_id"],
+            "faculty_id": v["faculty_id"],
+            "room_id": v["room_id"],
+            "day": t // S,
+            "slot": t % S,
+            "source": v["source"]
+        })
 
-        for si, s in enumerate(sessions):
-            if si not in scheduled_session_ids:
-                unscheduled.append({"session_id": s["session_id"], "subject_id": s["subject_id"], "batch_id": s["batch_id"]})
+    # Fill OR-Tools results
+    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        for sess in remaining_sessions:
+            for t in range(T):
+                for r in classrooms:
+                    if (sess["session_id"], t, r.id) in x and solver.Value(x[(sess["session_id"], t, r.id)]) == 1:
+                        timetable[t].append({
+                            "session_id": sess["session_id"],
+                            "subject_id": sess["subject_id"],
+                            "batch_id": sess["batch_id"],
+                            "faculty_id": None,
+                            "room_id": r.id,
+                            "day": t // S,
+                            "slot": t % S,
+                            "source": "ortools"
+                        })
 
-        readable = []
-        for day_idx in range(D):
-            row = {"day": days[day_idx], "slots": []}
-            for slot_idx in range(S):
-                tt = timeslot_index(day_idx, slot_idx, S)
-                cells = timetable[tt]
-                if cells:
-                    cell = cells[0]
-                    readable_cell = {
-                        "subject": subjects[cell["subject_id"]].name if subjects[cell["subject_id"]].name else cell["subject_id"],
-                        "batch": batches[cell["batch_id"]].name if cell["batch_id"] in batches else cell["batch_id"],
-                        "faculty": faculties[cell["faculty_id"]].name if cell["faculty_id"] in faculties else cell["faculty_id"],
-                        "room": next((r.name for r in classrooms if r.id == cell["room_id"]), cell["room_id"])
-                    }
-                else:
-                    readable_cell = None
-                row["slots"].append(readable_cell)
-            readable.append(row)
+    # Build readable response
+    readable = []
+    for day_idx in range(D):
+        row = {"day": days[day_idx], "slots": []}
+        for slot_idx in range(S):
+            tt = timeslot_index(day_idx, slot_idx, S)
+            cells = timetable[tt]
+            if cells:
+                cell = cells[0]
+                readable_cell = {
+                    "subject": subjects[cell["subject_id"]].name if cell["subject_id"] in subjects else cell["subject_id"],
+                    "batch": batches[cell["batch_id"]].name if cell["batch_id"] in batches else cell["batch_id"],
+                    "faculty": faculties[cell["faculty_id"]].name if cell["faculty_id"] in faculties else cell["faculty_id"],
+                    "room": next((r.name for r in classrooms if r.id == cell["room_id"]), cell["room_id"]),
+                    "source": cell["source"]
+                }
+            else:
+                readable_cell = None
+            row["slots"].append(readable_cell)
+        readable.append(row)
 
-        faculty_loads = {fid: solver.Value(fac_load[fidx]) for fidx, fid in enumerate(faculty_ids)}
-        return {
-            "status": "ok",
-            "scheduled_count": int(sum(solver.Value(sv) for sv in scheduled_vars)),
-            "timetable_matrix": readable,
-            "unscheduled": unscheduled,
-            "faculty_loads": faculty_loads
-        }
-
-    return {"status": "infeasible", "message": "No feasible schedule found"}
+    return {
+        "status": "ok",
+        "method": "hybrid (greedy + ortools)",
+        "timetable_matrix": readable,
+        "pre_filled": len(greedy_assignments),
+        "remaining_scheduled": len(remaining_sessions)
+    }
 
 if __name__ == "__main__":
     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
